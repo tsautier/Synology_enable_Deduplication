@@ -9,7 +9,7 @@
 # sudo /volume1/scripts/syno_enable_dedupe.sh
 #-------------------------------------------------------------------------------
 
-scriptver="v1.4.33"
+scriptver="v1.5.34"
 script=Synology_enable_Deduplication
 repo="007revad/Synology_enable_Deduplication"
 scriptname=syno_enable_dedupe
@@ -194,10 +194,17 @@ buildphase=$(/usr/syno/bin/synogetkeyvalue /etc.defaults/VERSION buildphase)
 buildnumber=$(/usr/syno/bin/synogetkeyvalue /etc.defaults/VERSION buildnumber)
 smallfixnumber=$(/usr/syno/bin/synogetkeyvalue /etc.defaults/VERSION smallfixnumber)
 
-# DSM 7.3.2 ignores support_tiny_btrfs_dedupe
+# DSM 7.3 and later ignore support_tiny_btrfs_dedupe
 # Even 4GB memory works with support_btrfs_dedupe
-if [[ $buildnumber -ge "86009" ]]; then
-    tiny=""
+if [[ $tiny == "yes" ]]; then
+    if [[ $buildnumber -ge "90075" ]]; then
+        echo -e "\n${Yellow}NOTE${Off} The --tiny option has no effect on DSM 7.4 and later"\
+            "(support_tiny_btrfs_dedupe no longer exists; Storage Efficiency only needs 4GB RAM)."
+        tiny=""
+    elif [[ $buildnumber -gt "72806" ]]; then
+        echo -e "\n${Yellow}NOTE${Off} The --tiny option has no effect on DSM 7.3 and later."
+        tiny=""
+    fi
 fi
 
 # Show DSM full version and model
@@ -627,10 +634,18 @@ if [[ $restore != "yes" ]] && [[ $skip != "yes" ]]; then
         ramgb=$((ramtotal / 1024))
 
         if [[ $storagemgrver ]]; then
-            # Only DSM 7.2.1 and later supports tiny dedupe
-            if [[ $tiny == "yes" ]] || [[ $ramtotal -lt 16384 ]]; then
-                ramneeded="4096"  # Tiny dedupe only needs 4GB ram
-                tiny="yes"
+            if [[ $buildnumber == "69057" || $buildnumber == "72806" ]]; then
+                # Only DSM 7.2.1 and 7.2.2 support tiny dedupe
+                if [[ $tiny == "yes" ]] && [[ $ramtotal -lt 16384 ]]; then
+                    ramneeded="4096"  # Tiny dedupe only needs 4GB ram
+                    tiny="yes"
+                else
+                    ramneeded="16384"  # Needs 16GB ram
+                    tiny=""
+                fi
+            elif [[ $buildnumber -ge "90075" ]]; then
+                # DSM 7.4 Storage Efficiency only needs 4GB ram
+                ramneeded="4096"
             else
                 ramneeded="16384"  # Needs 16GB ram
                 tiny=""
@@ -712,6 +727,176 @@ findbytes(){
     fi
 }
 
+is_syno_drive_action(){ 
+    # Patch SYNODiskIsSynology in libhwcontrol.so.1 so is_syno_drive
+    # is always true, unlocking the new Storage Efficiency feature
+    # for non-Synology drives on DSM 7.4+ (StorageManager 1.1.0-2018+).
+    #
+    # $1 = target file, $2 = mode: "patch" (default) or "check"
+    #
+    # Return codes:
+    #   0 = already patched / patched successfully
+    #   1 = not patched (check mode) / already patched (patch mode, not an error)
+    #   2 = error (pattern not found, ambiguous match, bad ELF, etc.)
+
+    local target="$1"
+    local mode="${2:-patch}"
+
+    python3 - "$target" "$mode" <<'PYEOF'
+import struct
+import sys
+
+SYMBOL = "SYNODiskIsSynology"
+OLD_BYTES = bytes.fromhex("85c00f95c0")
+NEW_BYTES = bytes.fromhex("b001909090")
+
+def die(msg, code=2):
+    print(f"\nERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def vaddr_to_offset(loads, vaddr):
+    for off, va, filesz in loads:
+        if va <= vaddr < va + filesz:
+            return off + (vaddr - va)
+    die(f"vaddr 0x{vaddr:x} not covered by any PT_LOAD segment")
+
+def locate(path):
+    with open(path, "rb") as f:
+        data = f.read()
+
+    if data[:4] != b"\x7fELF" or data[4] != 2:
+        die("not a 64-bit ELF file")
+
+    e_phoff   = struct.unpack_from("<Q", data, 0x20)[0]
+    e_phentsz = struct.unpack_from("<H", data, 0x36)[0]
+    e_phnum   = struct.unpack_from("<H", data, 0x38)[0]
+
+    loads = []
+    dyn_off = dyn_sz = None
+
+    for i in range(e_phnum):
+        ph = data[e_phoff + i*e_phentsz : e_phoff + (i+1)*e_phentsz]
+        p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = \
+            struct.unpack_from("<IIQQQQQQ", ph)
+        if p_type == 1:
+            loads.append((p_offset, p_vaddr, p_filesz))
+        elif p_type == 2:
+            dyn_off, dyn_sz = p_offset, p_filesz
+
+    if dyn_off is None:
+        die("no PT_DYNAMIC segment found")
+
+    dyn_tags = {}
+    pos = dyn_off
+    while pos < dyn_off + dyn_sz:
+        d_tag, d_val = struct.unpack_from("<qQ", data, pos)
+        if d_tag == 0:
+            break
+        dyn_tags[d_tag] = d_val
+        pos += 16
+
+    for tag in (6, 5, 0xa, 0xb, 4):
+        if tag not in dyn_tags:
+            die(f"required DT_* tag 0x{tag:x} missing from dynamic section")
+
+    symtab_off = vaddr_to_offset(loads, dyn_tags[6])
+    strtab_off = vaddr_to_offset(loads, dyn_tags[5])
+    strtab_sz  = dyn_tags[0xa]
+    syment     = dyn_tags[0xb]
+    hash_off   = vaddr_to_offset(loads, dyn_tags[4])
+
+    nbucket, nchain = struct.unpack_from("<II", data, hash_off)
+    strtab = data[strtab_off:strtab_off + strtab_sz]
+
+    def get_str(o):
+        end = strtab.find(b"\x00", o)
+        return strtab[o:end].decode("utf-8", "replace")
+
+    sym_addr = sym_size = None
+    for i in range(nchain):
+        entry = data[symtab_off + i*syment : symtab_off + (i+1)*syment]
+        if len(entry) < syment:
+            break
+        st_name, st_info, st_other, st_shndx, st_value, st_size = \
+            struct.unpack("<IBBHQQ", entry)
+        if get_str(st_name) == SYMBOL:
+            sym_addr, sym_size = st_value, st_size
+            break
+
+    if sym_addr is None:
+        die(f"symbol {SYMBOL} not found in dynamic symbol table")
+    if sym_size == 0:
+        die(f"symbol {SYMBOL} has size 0 (likely undefined/imported, not local)")
+
+    func_off = vaddr_to_offset(loads, sym_addr)
+    return data, func_off, sym_size
+
+def main():
+    path = sys.argv[1]
+    mode = sys.argv[2] if len(sys.argv) > 2 else "patch"
+
+    data, func_off, sym_size = locate(path)
+    window = data[func_off : func_off + sym_size]
+
+    old_hits = [i for i in range(len(window) - len(OLD_BYTES) + 1)
+                if window[i:i+len(OLD_BYTES)] == OLD_BYTES]
+    new_hits = [i for i in range(len(window) - len(NEW_BYTES) + 1)
+                if window[i:i+len(NEW_BYTES)] == NEW_BYTES]
+
+    if old_hits and new_hits:
+        die(f"both patched and unpatched patterns found within {SYMBOL} — "
+            f"file may be corrupted or from an unexpected build")
+
+    if mode == "check":
+        if new_hits:
+            print(f"\nAlready patched at file offset 0x{func_off + new_hits[0]:x}")
+            sys.exit(0)
+        if len(old_hits) == 1:
+            print(f"\nNot patched — original bytes found at file offset 0x{func_off + old_hits[0]:x}")
+            sys.exit(1)
+        if len(old_hits) > 1:
+            die(f"{len(old_hits)} matches for {OLD_BYTES.hex()} within {SYMBOL} — "
+                f"ambiguous, cannot determine patch state. Offsets: "
+                f"{[hex(func_off+h) for h in old_hits]}")
+        die(f"neither pattern found within {SYMBOL} "
+            f"(0x{func_off:x}..0x{func_off+sym_size:x}) — DSM build may have changed")
+
+    # mode == "patch"
+    if new_hits:
+        print(f"\nAlready patched at file offset 0x{func_off + new_hits[0]:x}")
+        sys.exit(1)
+    if len(old_hits) == 0:
+        die(f"pattern {OLD_BYTES.hex()} not found within {SYMBOL} "
+            f"(0x{func_off:x}..0x{func_off+sym_size:x}) — DSM build may have changed")
+    if len(old_hits) > 1:
+        die(f"{len(old_hits)} matches for {OLD_BYTES.hex()} within {SYMBOL} — "
+            f"ambiguous, refusing to patch. Offsets: "
+            f"{[hex(func_off+h) for h in old_hits]}")
+
+    patch_off = func_off + old_hits[0]
+    print(f"\nFound unique match for {SYMBOL} at file offset 0x{patch_off:x}")
+
+    with open(path, "r+b") as f:
+        f.seek(patch_off)
+        f.write(NEW_BYTES)
+
+    print(f"Patched 0x{patch_off:x}: {OLD_BYTES.hex()} -> {NEW_BYTES.hex()}")
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()
+PYEOF
+    return $?
+}
+
+if [[ -f "$strgmgr" ]] && grep -q 'openHDDReductionWindow' "$strgmgr"; then
+    newreduction="yes"
+fi
+
+if [[ $hdd == "yes" ]] && [[ $newreduction == "yes" ]]; then
+    echo -e "\n${Yellow}NOTE${Off} The --hdd option is not needed on DSM 7.4 and later"\
+        "(HDD support \nis handled natively by the Storage Efficiency menu)."
+fi
 
 # Check value in file and backup file
 if [[ $check == "yes" ]]; then
@@ -739,30 +924,45 @@ if [[ $check == "yes" ]]; then
     # DSM 7.2.1 only and only if --hdd option used
     # Dedupe config button for HDDs and 2.5 inch SSDs in DSM 7.2.1
 #    if [[ -f "$strgmgr" ]] && [[ $hdd == "yes" ]]; then
-    if [[ -f "$strgmgr" ]]; then
-        # StorageManager package is installed and --hdd option used
+    if [[ -f "$strgmgr" ]] && [[ $newreduction != "yes" ]]; then
         if ! grep '&&e.dedup_info.show_config_btn' "$strgmgr" >/dev/null; then
             echo -e "\nDedupe config menu for HDDs and 2.5\" SSDs is ${Cyan}enabled${Off}."
         else
             echo -e "\nDedupe config menu for HDDs and 2.5\" SSDs is ${Cyan}not${Off} enabled."
             echo "Run the script with the --hdd option if you want it enabled."
         fi
+    elif [[ -f "$strgmgr" ]]; then
+        echo -e "\nStorage Efficiency menu is handled natively by DSM 7.4+ so no patch needed."
     fi
 
     # Check value in file
     echo -e "\nChecking non-Synology drive supported."
-    hexstring="80 3E 00 B8 01 00 00 00 90 90 48 8B"
-    findbytes "$libhw"
-    if [[ $bytes == "9090" ]]; then
-        echo -e "File is already edited."
-    else
-        hexstring="80 3E 00 B8 01 00 00 00 75 2. 48 8B"
-        findbytes "$libhw"
-        if [[ $bytes =~ "752"[0-9] ]]; then
-            echo -e "File is ${Cyan}not${Off} edited."
+    if [[ $newreduction == "yes" ]]; then
+        if command -v python3 >/dev/null 2>&1; then
+            is_syno_drive_action "$libhw" check
+            case $? in
+                0) echo -e "File is already edited." ;;
+                1) echo -e "File is ${Cyan}not${Off} edited." ;;
+                *) echo -e "${Red}hex string not found!${Off}"; err=1 ;;
+            esac
         else
-            echo -e "${Red}hex string not found!${Off}"
+            echo -e "${Red}python3 not found — cannot check patch status!${Off}"
             err=1
+        fi
+    else
+        hexstring="80 3E 00 B8 01 00 00 00 90 90 48 8B"
+        findbytes "$libhw"
+        if [[ $bytes == "9090" ]]; then
+            echo -e "File is already edited."
+        else
+            hexstring="80 3E 00 B8 01 00 00 00 75 2. 48 8B"
+            findbytes "$libhw"
+            if [[ $bytes =~ "752"[0-9] ]]; then
+                echo -e "File is ${Cyan}not${Off} edited."
+            else
+                echo -e "${Red}hex string not found!${Off}"
+                err=1
+            fi
         fi
     fi
 
@@ -828,44 +1028,66 @@ fi
 # Edit libhwcontrol
 
 #echo -e "\nChecking $(basename -- "$libhw")."
+#echo -e "\nChecking non-Synology drive supported."
 
-# Check if the file is already edited
-hexstring="80 3E 00 B8 01 00 00 00 90 90 48 8B"
-findbytes "$libhw"
-if [[ $bytes == "9090" ]]; then
-    #echo -e "\n$(basename -- "$libhw") already edited."
-    echo -e "\nNon-Synology drive support already enabled."
-else
-    # Check if the file is okay for editing
-    hexstring="80 3E 00 B8 01 00 00 00 75 2. 48 8B"
-    findbytes "$libhw"
-    if ! [[ $bytes =~ "752"[0-9] ]]; then
+if [[ $newreduction == "yes" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+        is_syno_drive_action "$libhw" patch
+        pyresult=$?
+        case $pyresult in
+            0) echo -e "\nEnabled non-Synology drive support for Storage Efficiency."
+               reboot="yes" ;;
+            1) echo -e "\nStorage Efficiency non-Synology drive support already enabled." ;;
+            *) ding
+               echo -e "${Error}ERROR${Off} Failed to patch $(basename -- "$libhw") for Storage Efficiency!"
+               err=1 ;;
+        esac
+    else
         ding
-        echo -e "\n${Red}hex string not found!${Off}"
+        echo -e "${Error}ERROR${Off} python3 not found — cannot enable Storage Efficiency for non-Synology drives."
+        err=1
+    fi
+    if [[ $err == 1 ]]; then
         exit 1
     fi
-
-    # Replace bytes in file
-    posrep=$(printf "%x\n" $((0x${poshex}+8)))
-    if ! printf %s "${posrep}: 9090" | xxd -r - "$libhw"; then
-        ding
-        echo -e "${Error}ERROR${Off} Failed to edit $(basename -- "$libhw")!"
-        exit 1
+else
+    # Check if the file is already edited
+    hexstring="80 3E 00 B8 01 00 00 00 90 90 48 8B"
+    findbytes "$libhw"
+    if [[ $bytes == "9090" ]]; then
+        #echo -e "\n$(basename -- "$libhw") already edited."
+        echo -e "\nNon-Synology drive support already enabled."
     else
-        # Check if libhwcontrol.so.1 was successfully edited
-        #echo -e "\nChecking if file was successfully edited."
-        hexstring="80 3E 00 B8 01 00 00 00 90 90 48 8B"
+        # Check if the file is okay for editing
+        hexstring="80 3E 00 B8 01 00 00 00 75 2. 48 8B"
         findbytes "$libhw"
-        if [[ $bytes == "9090" ]]; then
-            #echo -e "File successfully edited."
-            echo -e "\nEnabled non-Synology drive support."
-            #echo -e "\n${Cyan}You can now enable data deduplication"\
-            #    "pool in Storage Manager.${Off}"
-            reboot="yes"
+        if ! [[ $bytes =~ "752"[0-9] ]]; then
+            ding
+            echo -e "\n${Red}hex string not found!${Off}"
+            exit 1
+        fi
+
+        # Replace bytes in file
+        posrep=$(printf "%x\n" $((0x${poshex}+8)))
+        if ! printf %s "${posrep}: 9090" | xxd -r - "$libhw"; then
+            ding
+            echo -e "${Error}ERROR${Off} Failed to edit $(basename -- "$libhw")!"
+            exit 1
+        else
+            # Check if libhwcontrol.so.1 was successfully edited
+            #echo -e "\nChecking if file was successfully edited."
+            hexstring="80 3E 00 B8 01 00 00 00 90 90 48 8B"
+            findbytes "$libhw"
+            if [[ $bytes == "9090" ]]; then
+                #echo -e "File successfully edited."
+                echo -e "\nEnabled non-Synology drive support."
+                #echo -e "\n${Cyan}You can now enable data deduplication"\
+                #    "pool in Storage Manager.${Off}"
+                reboot="yes"
+            fi
         fi
     fi
 fi
-
 
 #------------------------------------------------------------------------------
 # Edit /etc.defaults/synoinfo.conf
@@ -977,20 +1199,30 @@ if [[ -f "$strgmgr" ]] && [[ $hdd == "yes" ]]; then
             fi
         fi
 
-        sed -i 's/&&e.dedup_info.show_config_btn//g' "$strgmgr"
-        # Check if we edited file
-        if ! grep '&&e.dedup_info.show_config_btn' "$strgmgr" >/dev/null; then
-            echo -e "Enabled dedupe config menu for HDDs and 2.5\" SSDs."
-            reload="yes"
+        if grep -q 'showHDDReductionBtn' "$strgmgr"; then
+            # DSM 7.4+ layout for new Storage Efficiency menu item already covers this,
+            # don't also force the legacy dedupe menu item on
+            echo -e "Storage Efficiency menu handled natively by DSM 7.4+ so no storage_panel.js \npatch needed."
         else
-            ding
-            echo -e "${Error}ERROR${Off} Failed to enable dedupe config menu for HDDs and 2.5\" SSDs!"
+            # pre-7.4 layout so apply the existing sed patch
+            sed -i 's/&&e.dedup_info.show_config_btn//g' "$strgmgr"
+
+            # Check if we edited file
+            if ! grep '&&e.dedup_info.show_config_btn' "$strgmgr" >/dev/null; then
+                echo -e "Enabled dedupe config menu for HDDs and 2.5\" SSDs."
+                reload="yes"
+            else
+                ding
+                echo -e "${Error}ERROR${Off} Failed to enable dedupe config menu for HDDs and 2.5\" SSDs!"
+            fi
         fi
     else
         echo -e "\nDedupe config menu for HDDs and 2.5\" SSDs already enabled."
     fi
 elif [[ -f "$strgmgr" ]]; then
-    if ! grep '&&e.dedup_info.show_config_btn' "$strgmgr" >/dev/null; then
+    if [[ $newreduction == "yes" ]]; then
+        echo -e "\nStorage Efficiency menu is handled natively by DSM 7.4+ so no patch needed."
+    elif ! grep '&&e.dedup_info.show_config_btn' "$strgmgr" >/dev/null; then
         echo -e "\nDedupe config menu for HDDs and 2.5\" SSDs is enabled."
     else
         echo -e "\nDedupe config menu for HDDs and 2.5\" SSDs not enabled."
@@ -999,7 +1231,7 @@ elif [[ -f "$strgmgr" ]]; then
 fi
 
 
-# Make sure xpe's storage_manager.js.gz includes our changes. Issue #88
+# Make sure xpe's storage_manager.js.gz includes our changes. Issue #88 #83 and maybe #73
 if [[ -f "${strgmgr}.gz" ]]; then
     gzip -c "${strgmgr}" > "${strgmgr}.gz"
 fi
